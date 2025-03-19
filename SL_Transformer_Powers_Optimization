@@ -1,0 +1,465 @@
+#import libraries
+import numpy as np
+import matplotlib.pyplot as plt
+import h5py
+from sklearn.model_selection import train_test_split
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from collections import OrderedDict
+
+# Hyperparameters
+d_model = 64
+num_heads = 4
+num_encoder_layers = 2
+dropout_rate = 0.1
+learning_rate = 0.001
+num_epochs = 10
+batch_size = 32
+num_APs = 16  
+max_power_ul = 1.0  #  normalized to 1.
+max_power_dl = 1.0  #  normalized to 1.
+
+# PreProcessing data
+def manual_normalize(data):
+    """
+    Manually normalize data to the range [0, 1] using min-max scaling.
+    Returns the normalized data, along with the min and max values for later use.
+    """
+    min_vals = np.min(data, axis=0)
+    max_vals = np.max(data, axis=0)
+    normalized_data = (data - min_vals) / (max_vals - min_vals + 1e-8)  # Add epsilon to avoid division by zero
+    return normalized_data, min_vals, max_vals
+
+def process_and_split_data_manual(filename):
+    """
+    Processes HDF5 data, normalizes user and AP positions,
+    normalizes UL and DL powers separately, and splits the data into training and testing sets.
+    """
+    # Load the HDF5 file
+    with h5py.File(filename, "r") as hdf_file:
+        # Load AP positions
+        ap_positions = np.array(hdf_file["AP_positions"])
+        # print(f"AP Positions shape: {ap_positions.shape}")
+        # Normalize AP positions
+        ap_positions, ap_min, ap_max = manual_normalize(ap_positions)
+        # Dictionaries to store train and test data
+        train_data = {}
+        test_data = {}
+        # Process each user count
+        for K in hdf_file["data"]:
+            # print(f"\nProcessing data for {K} users...")
+            user_data = {}
+            for key in hdf_file[f"data/{K}"]:
+                user_data[key] = np.array(hdf_file[f"data/{K}/{key}"])
+
+            # Original shapes from the dataset
+            num_samples = user_data["user_positions"].shape[0]  # Number of samples
+            num_users = user_data["user_positions"].shape[1]    # Number of users
+            num_APs = ap_positions.shape[0]                     # Number of APs
+            # Normalize user positions
+            user_positions, user_min, user_max = manual_normalize(user_data["user_positions"])  # Shape: (samples, num_users, 2)
+            # Initialize gamma with the correct shape (samples, users, 2 * num_APs + 2)
+            gamma = np.zeros((num_samples, num_users, 2 * num_APs + 2))
+
+            # Iterate through each sample and user to populate gamma
+            for sample_idx in range(num_samples):
+                for user_idx in range(num_users):
+                    # AP positions for this user (repeated for each user in the sample)
+                    gamma[sample_idx, user_idx, :2 * num_APs] = np.tile(ap_positions.flatten(), 1)
+
+                    # User position for this user
+                    # user_position = user_data["user_positions"][sample_idx, user_idx]
+                    gamma[sample_idx, user_idx, 2 * num_APs:] = user_positions[sample_idx, user_idx]  # Store user position
+            betaN, b_min, b_max = manual_normalize(user_data["gamma"])  # Shape: (samples, num_users, number APs)
+            # Normalize UL and DL powers separately
+            ul_powers, ul_min, ul_max = manual_normalize(user_data["optimal_UL_powers"])  # Shape: (samples, num_users)
+            dl_powers, dl_min, dl_max = manual_normalize(user_data["optimal_DL_powers"])  # Shape: (samples, num_users)
+            # Concatenate normalized UL and DL powers to form the output
+            y = np.hstack([ul_powers, dl_powers])  # Shape: (samples, 2 * num_users)
+            # Split data and retain indices
+            X_train, X_test, y_train, y_test, indices_train, indices_test = train_test_split(
+                gamma, y, np.arange(num_samples), test_size=0.1, random_state=42
+            )
+            X_train2, X_test2, y_train2, y_test2, indices_train2, indices_test2 = train_test_split(
+                betaN, y, np.arange(num_samples), test_size=0.1, random_state=42
+            )
+
+            train_data[K] = {
+                "X_train": X_train,
+                "y_train": y_train,
+                "X_train2": X_train2,
+                "y_train2": y_train2,
+                "b_min": b_min,
+                "b_max": b_max,
+
+            }
+
+            test_data[K] = {
+                "X_test": X_test,
+                "y_test": y_test,
+                "X_test2": X_test2,
+                "y_test2": y_test2,
+                "b_min": b_min,
+                "b_max": b_max,
+                "ul_min": ul_min,
+                "ul_max": ul_max,
+                "dl_min": dl_min,
+                "dl_max": dl_max,
+                "interf_UL": user_data["interf_UL"][indices_test],
+                "interf_DL": user_data["interf_DL"][indices_test],
+                "noise_UL": user_data["noise_UL"][indices_test],
+                "noise_DL": user_data["noise_DL"][indices_test],
+                "optimal_DL_SE": user_data["optimal_DL_SE"][indices_test],
+                "optimal_UL_SE": user_data["optimal_UL_SE"][indices_test],
+                "signal_UL": user_data["signal_UL"][indices_test],
+                "signal_DL": user_data["signal_DL"][indices_test],
+            }
+
+    return train_data, test_data
+
+def process_newK_data(filename):
+
+    # Load the HDF5 file
+    with h5py.File(filename, "r") as hdf_file:
+        # Load AP positions
+        ap_positions = np.array(hdf_file["AP_positions"])
+
+        # Normalize AP positions
+        ap_positions, ap_min, ap_max = manual_normalize(ap_positions)
+
+        # Dictionaries to store NEW test data
+        Ntest_data = {}
+
+        # Process each user count
+        for K in hdf_file["data"]:
+            print(f"\nProcessing data for {K} users...")
+
+            user_data = {}
+            for key in hdf_file[f"data/{K}"]:
+                user_data[key] = np.array(hdf_file[f"data/{K}/{key}"])
+
+            # Original shapes from the dataset
+            num_samples = user_data["user_positions"].shape[0]  # Number of samples
+            num_users = user_data["user_positions"].shape[1]    # Number of users
+            num_APs = ap_positions.shape[0]                     # Number of APs
+            # Normalize user positions
+            user_positions, user_min, user_max = manual_normalize(user_data["user_positions"])  # Shape: (samples, num_users, 2)
+            # Initialize gamma with the correct shape (samples, users, 2 * num_APs + 2)
+            Ngamma = np.zeros((num_samples, num_users, 2 * num_APs + 2))
+
+            # Iterate through each sample and user to populate gamma
+            for sample_idx in range(num_samples):
+                for user_idx in range(num_users):
+                    # AP positions for this user (repeated for each user in the sample)
+                    Ngamma[sample_idx, user_idx, :2 * num_APs] = np.tile(ap_positions.flatten(), 1)
+
+
+                    Ngamma[sample_idx, user_idx, 2 * num_APs:] = user_positions[sample_idx, user_idx]  # Store user position
+            NNbeta, b_min, b_max = manual_normalize(user_data["gamma"])  # Shape: (samples, num_users, number APs)
+            # Normalize UL and DL powers separately
+            ul_powers, ul_min, ul_max = manual_normalize(user_data["optimal_UL_powers"])  # Shape: (samples, num_users)
+            dl_powers, dl_min, dl_max = manual_normalize(user_data["optimal_DL_powers"])  # Shape: (samples, num_users)
+
+            # Concatenate normalized UL and DL powers to form the output
+            Ny = np.hstack([ul_powers, dl_powers])  # Shape: (samples, 2 * num_users)
+
+            Ntest_data[K] = {
+                "X_test": Ngamma,
+                "X_test2": NNbeta,
+                "b_min": b_min,
+                "b_max": b_max,
+                "y_test": Ny,
+                "ul_min": ul_min,
+                "ul_max": ul_max,
+                "dl_min": dl_min,
+                "dl_max": dl_max,
+                "interf_UL": user_data["interf_UL"],
+                "interf_DL": user_data["interf_DL"],
+                "noise_UL": user_data["noise_UL"],
+                "noise_DL": user_data["noise_DL"],
+                "optimal_DL_SE": user_data["optimal_DL_SE"],
+                "optimal_UL_SE": user_data["optimal_UL_SE"],
+                "signal_UL": user_data["signal_UL"],
+                "signal_DL": user_data["signal_DL"],
+            }
+    return  Ntest_data
+
+def compute_SINR(interf, signal, noise, p):
+    """
+    Compute SINR for all users in a batch of test samples.
+
+    Args:
+        interf: Interference matrix, shape (batch_size, K, K)
+        signal: Signal array, shape (batch_size, K)
+        noise: Noise array, shape (batch_size, K)
+        p: Power array, shape (batch_size, K)
+
+    Returns:
+        SINR: Array of SINR values, shape (batch_size, K)
+    """
+    batch_size, K = signal.shape
+    SINR = np.zeros((batch_size, K))
+
+    for b in range(batch_size):
+        for k in range(K):
+            SINR[b, k] = (
+                p[b, k] * signal[b, k] /
+                (np.dot(interf[b, :, k], p[b]) + noise[b, k])
+            )
+    return SINR
+# Run the function and get the train and test data
+filename = "cell_free_mMIMO_combined_datasmall.hdf5"
+train_data, test_data = process_and_split_data_manual(filename)
+train_data = OrderedDict(sorted(train_data.items(), key=lambda item: int(item[0])))
+test_data = OrderedDict(sorted(test_data.items(), key=lambda item: int(item[0])))
+#===================================================================================================================
+# Transformer Encoder Class with Attention Mechanism
+class PowerAllocationTransformer(nn.Module):
+    def __init__(self, d_model, num_heads, num_encoder_layers, num_APs, max_power_ul, max_power_dl, dropout_rate):
+        super(PowerAllocationTransformer, self).__init__()
+
+        # Transformer Encoder with Dropout
+        self.encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=num_heads, dropout=dropout_rate
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            self.encoder_layer, num_layers=num_encoder_layers
+        )
+       
+        # Maximum allowed power for UL and DL
+        self.max_power_ul = max_power_ul
+        self.max_power_dl = max_power_dl
+
+    def forward(self, x):
+        # Input shape: (batch_size, num_users, 2 * num_APs)
+        # Input transformation to match model dimensions
+        self.fc_input = nn.Linear(2 * num_APs + 2, d_model)  # Input: AP + user positions (gamma)
+        self.fc_out_ul = nn.Linear(d_model, 1)  # Output: Predict uplink power for each user
+        self.fc_out_dl = nn.Linear(d_model, 1)  # Output: Predict downlink power for each user
+
+        # Transform input to match Transformer model's requirements
+        x = self.fc_input(x)  # Shape: (batch_size, num_users, d_model)
+
+        # Rearrange for the transformer (seq_len, batch_size, d_model)
+        x = x.permute(1, 0, 2)  # Shape: (num_users, batch_size, d_model)
+        x = self.transformer_encoder(x)  # Apply Transformer Encoder
+        x = x.permute(1, 0, 2)  # Change back to (batch_size, num_users, d_model)
+
+        # Predict uplink and downlink powers
+        ul_powers = self.fc_out_ul(x)  # Shape: (batch_size, num_users, 1)
+        dl_powers = self.fc_out_dl(x)  # Shape: (batch_size, num_users, 1)
+
+        # Scale predictions to their respective ranges
+        ul_powers = torch.sigmoid(ul_powers) * self.max_power_ul  # Scale UL powers to [0, max_power_ul]
+        dl_powers = torch.sigmoid(dl_powers) * self.max_power_dl  # Scale DL powers to [0, max_power_dl]
+
+        # Reshape and concatenate UL and DL powers
+        ul_powers = ul_powers.squeeze(-1) # Shape: (batch_size, num_users)
+        dl_powers = dl_powers.squeeze(-1) # Shape: (batch_size, num_users)
+
+        output = torch.cat((ul_powers, dl_powers), dim=-1)  # Shape: (batch_size, 2 * num_users)
+
+        return output
+#===============================================================================================================
+# Training the model
+# Dataset Class
+class GammaPowerDataset(Dataset):
+    def __init__(self, gamma, y):
+        self.gamma = gamma
+        self.y = y
+
+    def __len__(self):
+        return self.gamma.shape[0]
+
+    def __getitem__(self, idx):
+        return torch.tensor(self.gamma[idx], dtype=torch.float32), torch.tensor(self.y[idx], dtype=torch.float32)
+
+# Training Function
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device):
+    model.to(device)
+    best_val_loss = float('inf')
+
+    for epoch in range(num_epochs):
+        # Training phase
+        model.train()
+        train_loss = 0
+        for gamma, y in train_loader:
+            gamma, y = gamma.to(device), y.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(gamma)
+            # print("shape of output", outputs.shape)
+            # print("shape of y", y.shape)
+            loss = criterion(outputs, y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        train_loss /= len(train_loader)
+
+        # Validation check
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for gamma, y in val_loader:
+                gamma, y = gamma.to(device), y.to(device)
+                outputs = model(gamma)
+                loss = criterion(outputs, y)
+                val_loss += loss.item()
+
+        val_loss /= len(val_loader)
+
+        print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), "best_model.pth")
+            # print("Saved Best Model!")
+
+# Prepare the Model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = PowerAllocationTransformer(
+    d_model=d_model,
+    num_heads=num_heads,
+    num_encoder_layers=num_encoder_layers,
+    num_APs=num_APs,
+    max_power_ul=max_power_ul,
+    max_power_dl=max_power_dl,
+    dropout_rate=dropout_rate
+)
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+# Training Loop
+for K, data in train_data.items():
+    print(f"Training for {K} users...")
+
+    # Create DataLoaders
+    train_dataset = GammaPowerDataset(data["X_train"], data["y_train"])
+    test_dataset = GammaPowerDataset(test_data[K]["X_test"], test_data[K]["y_test"])
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    # Train the Model
+    train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device)
+#======================================================================================
+################################EVALUATION###########################################
+#======================================================================================
+# Evaluating SE on test set for new values of K
+Nfilename = "cell_free_mMIMO_test_datasmall1002.hdf5"
+Ntest_data = process_newK_data(Nfilename)
+Nfilename2 = "cell_free_mMIMO_test_datasmall1003.hdf5"
+Ntest_data2 = process_newK_data(Nfilename2)
+# Initialize the combined dictionary
+alltest_data = {}
+# Add data from test_data (users 2 to 10)
+for K, data in test_data.items():
+    alltest_data[K] = data
+# Add data from Ntest_data (users more than 10)
+for K, data in Ntest_data.items():
+    alltest_data[K] = data
+for K, data in Ntest_data2.items():
+    alltest_data[K] = data
+alltest_data = OrderedDict(sorted(alltest_data.items(), key=lambda item: int(item[0])))
+#=========================
+# Initialize lists to store results for all K
+user_counts = []
+sum_SE_UL_pred_allpos = []
+sum_SE_DL_pred_allpos = []
+sum_SE_UL_opt_all = []
+sum_SE_DL_opt_all = []
+per_UE_SE_UL_pred_allpos = []
+per_UE_SE_DL_pred_allpos = []
+per_UE_SE_UL_opt_all = []
+per_UE_SE_DL_opt_all = []
+# Load the saved model weights
+model.load_state_dict(torch.load("best_model.pth"))
+# Iterate over test data for each K
+for K, data in alltest_data.items():
+    # print(f"Evaluating for {K} users...")
+    K = int(K)
+    # Extract test data
+    X_testpos = torch.tensor(data["X_test"], dtype=torch.float32).to(device)
+    interf_UL, interf_DL = data["interf_UL"], data["interf_DL"]
+    noise_UL, noise_DL = data["noise_UL"], data["noise_DL"]
+    signal_UL, signal_DL = data["signal_UL"], data["signal_DL"]
+    optimal_UL_SE = data["optimal_UL_SE"].reshape(-1, K)
+    optimal_DL_SE = data["optimal_DL_SE"].reshape(-1, K)
+    ul_min = data["ul_min"]
+    ul_max = data["ul_max"]
+    dl_min = data["dl_min"]
+    dl_max = data["dl_max"]
+
+    with torch.no_grad():
+        # Get denormalized predictions
+        predictionspos = model(X_testpos)
+        predicted_UL_powers_normalizedpos = predictionspos[:, :K].cpu().numpy()  # Normalized UL powers
+        predicted_DL_powers_normalizedpos = predictionspos[:, K:].cpu().numpy()  # Normalized DL powers
+        # Denormalize the predictions
+        predicted_UL_powerspos = predicted_UL_powers_normalizedpos * (ul_max - ul_min) + ul_min
+        predicted_DL_powerspos = predicted_DL_powers_normalizedpos * (dl_max - dl_min) + dl_min
+
+    # Compute SINR and SE for predicted powers
+    SINR_UL_predpos = compute_SINR(interf_UL, signal_UL, noise_UL, predicted_UL_powerspos)
+    SINR_DL_predpos = compute_SINR(interf_DL, signal_DL, noise_DL, predicted_DL_powerspos)
+    SE_UL_predpos = np.log2(1 + SINR_UL_predpos )
+    SE_DL_predpos = np.log2(1 + SINR_DL_predpos )
+
+    # Aggregate results for this K
+    sum_SE_UL_pred_allpos.append(SE_UL_predpos.mean(axis=0).sum())  # Predicted sum SE for UL
+    sum_SE_DL_pred_allpos.append(SE_DL_predpos.mean(axis=0).sum())  # Predicted sum SE for DL
+    sum_SE_UL_opt_all.append(optimal_UL_SE.mean(axis=0).sum())  # Optimal sum SE for UL
+    sum_SE_DL_opt_all.append(optimal_DL_SE.mean(axis=0).sum())  # Optimal sum SE for DL
+    per_UE_SE_UL_pred_allpos.append(sum_SE_UL_pred_allpos[-1] / K)  # Predicted per-UE SE for UL
+    per_UE_SE_DL_pred_allpos.append(sum_SE_DL_pred_allpos[-1] / K)  # Predicted per-UE SE for DL
+    per_UE_SE_UL_opt_all.append(sum_SE_UL_opt_all[-1] / K)    # Optimal per-UE SE for UL
+    per_UE_SE_DL_opt_all.append(sum_SE_DL_opt_all[-1] / K)    # Optimal per-UE SE for DL
+    user_counts.append(K)  # Store the user count
+
+# Plot Sum SE vs K  sum_SE_UL_opt_all
+plt.figure(figsize=(10, 6))
+plt.plot(user_counts, sum_SE_UL_pred_allpos, label="Predicted UL Sum SE (input position)", linestyle="--", marker="o")
+plt.plot(user_counts, sum_SE_DL_pred_allpos, label="Predicted DL Sum SE (input position)", linestyle="--", marker="o")
+plt.plot(user_counts, sum_SE_UL_opt_all, label="Optimal UL Sum SE", linestyle="-", marker="s")
+plt.plot(user_counts, sum_SE_DL_opt_all, label="Optimal DL Sum SE", linestyle="-", marker="s")
+plt.title("Sum SE vs Number of Users")
+plt.xlabel("Number of Users (K)")
+plt.ylabel("Sum SE (bps/Hz)")
+plt.legend()
+plt.grid()
+plt.show()
+
+# Plot Per-UE SE vs K per_UE_SE_UL_opt_all
+plt.figure(figsize=(10, 6))
+plt.plot(user_counts, per_UE_SE_UL_pred_allpos, label="Predicted UL Per-UE SE (input position)", linestyle="--", marker="o")
+plt.plot(user_counts, per_UE_SE_DL_pred_allpos, label="Predicted DL Per-UE SE (input position)", linestyle="--", marker="o")
+plt.plot(user_counts, per_UE_SE_UL_opt_all, label="Optimal UL Per-UE SE", linestyle="-", marker="s")
+plt.plot(user_counts, per_UE_SE_DL_opt_all, label="Optimal DL Per-UE SE", linestyle="-", marker="s")
+plt.title("Per-UE SE vs Number of Users")
+plt.xlabel("Number of Users (K)")
+plt.ylabel("Per-UE SE (bps/Hz)")
+plt.legend()
+plt.grid()
+plt.show()
+
+# Combine all variables into a dictionary
+results_data = {
+     "user_counts": user_counts,
+     "sum_SE_UL_pred_allpos": sum_SE_UL_pred_allpos,
+     "sum_SE_DL_pred_allpos": sum_SE_DL_pred_allpos,
+     "sum_SE_UL_opt_all": sum_SE_UL_opt_all,
+     "sum_SE_DL_opt_all": sum_SE_DL_opt_all,
+     "per_UE_SE_UL_pred_allpos": per_UE_SE_UL_pred_allpos,
+     "per_UE_SE_DL_pred_allpos": per_UE_SE_DL_pred_allpos,
+     "per_UE_SE_UL_opt_all": per_UE_SE_UL_opt_all,
+     "per_UE_SE_DL_opt_all": per_UE_SE_DL_opt_all,
+}
+#
+# Save the dictionary as a pickle file
+with open("betSL_results.pkl", "wb") as file:
+    pickle.dump(results_data, file)
+
+print("Results saved successfully!")
