@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 from collections import OrderedDict
 
 # Hyperparameters
-d_model = 64
+d_model = 32
 num_heads = 4
 num_encoder_layers = 2
 dropout_rate = 0.1
@@ -231,13 +231,14 @@ class PowerAllocationTransformer(nn.Module):
         # Maximum allowed power for UL and DL
         self.max_power_ul = max_power_ul
         self.max_power_dl = max_power_dl
-
-    def forward(self, x):
-        # Input shape: (batch_size, num_users, 2 * num_APs)
-        # Input transformation to match model dimensions
+       
         self.fc_input = nn.Linear(2 * num_APs + 2, d_model)  # Input: AP + user positions (gamma)
         self.fc_out_ul = nn.Linear(d_model, 1)  # Output: Predict uplink power for each user
         self.fc_out_dl = nn.Linear(d_model, 1)  # Output: Predict downlink power for each user
+
+    def forward(self, x):
+        # Input shape: (batch_size, num_users, 2 * num_APs)
+       
 
         # Transform input to match Transformer model's requirements
         x = self.fc_input(x)  # Shape: (batch_size, num_users, d_model)
